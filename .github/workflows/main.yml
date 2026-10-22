@@ -1,0 +1,111 @@
+name: Ubuntu RDP
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp:
+    # قفل کردن روی نسخه ۲۴.۰۴ برای جلوگیری از تغییرات ناگهانی گیت‌هاب
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+
+    steps:
+      - name: Install XFCE (Lightweight), xrdp, and dependencies
+        run: |
+          sudo apt-get update -y
+          # با --no-install-recommends از دانلود بسته‌های غیرضروری جلوگیری می‌کنیم
+          # با حذف xfce4-goodies فقط محیط اصلی و ترمینال را نصب می‌کنیم
+          sudo apt-get install -y --no-install-recommends \
+            xrdp xorgxrdp xserver-xorg-core \
+            xfce4 xfce4-terminal \
+            dbus-x11 x11-xserver-utils
+
+      - name: Disable gnome-remote-desktop to free port 3389
+        run: |
+          sudo systemctl stop gnome-remote-desktop 2>/dev/null || true
+          sudo systemctl disable gnome-remote-desktop 2>/dev/null || true
+
+      - name: Fix xrdp startup for Ubuntu 24.04 (prevent black screen)
+        run: |
+          if ! grep -q 'unset DBUS_SESSION_BUS_ADDRESS' /etc/xrdp/startwm.sh; then
+            sudo sed -i '/test -x \/etc\/X11\/Xsession/i unset DBUS_SESSION_BUS_ADDRESS\nunset XDG_RUNTIME_DIR' /etc/xrdp/startwm.sh
+          fi
+
+      - name: Create RDP user and configure XFCE session
+        run: |
+          PASSWORD=$(tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 16)
+
+          sudo useradd -m -s /bin/bash -G sudo RDP
+          echo "RDP:$PASSWORD" | sudo chpasswd
+
+          # تنظیم DBus و محیط برای جلوگیری از خطای Failsafe
+          cat << 'EOF' | sudo tee /home/RDP/.xsession
+          #!/bin/bash
+          export XDG_CONFIG_DIRS=/etc/xdg
+          export XDG_CURRENT_DESKTOP=XFCE
+          export XDG_SESSION_DESKTOP=xfce
+          exec dbus-launch --exit-with-session startxfce4
+          EOF
+
+          sudo chmod 755 /home/RDP/.xsession
+          sudo chown RDP:RDP /home/RDP/.xsession
+
+          echo "RDP_PASSWORD=$PASSWORD" >> $GITHUB_ENV
+
+      - name: Configure xrdp and start service
+        run: |
+          sudo adduser xrdp ssl-cert || true
+          sudo systemctl enable --now xrdp
+          sudo systemctl restart xrdp
+
+      - name: Install and start Tailscale
+        run: |
+          curl -fsSL https://tailscale.com/install.sh | sh
+          sudo systemctl enable --now tailscaled
+
+      - name: Establish Tailscale Connection
+        run: |
+          sudo tailscale up \
+            --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} \
+            --hostname=gh-runner-$GITHUB_RUN_ID
+
+          TS_IP=""
+          for i in $(seq 1 10); do
+            TS_IP=$(sudo tailscale ip -4 2>/dev/null | head -n1 || true)
+            [ -n "$TS_IP" ] && break
+            sleep 5
+          done
+
+          if [ -z "$TS_IP" ]; then
+            echo "Tailscale IP not assigned"
+            exit 1
+          fi
+          echo "TAILSCALE_IP=$TS_IP" >> $GITHUB_ENV
+
+      - name: Verify RDP Accessibility
+        run: |
+          echo "Tailscale IP: $TAILSCALE_IP"
+          if timeout 5 bash -c "</dev/tcp/$TAILSCALE_IP/3389" 2>/dev/null; then
+            echo "TCP connectivity successful!"
+          else
+            echo "TCP connection failed"
+            exit 1
+          fi
+
+      - name: Show Credentials
+        run: |
+          echo "======================================"
+          echo "  RDP ACCESS"
+          echo "======================================"
+          echo "  Address : $TAILSCALE_IP"
+          echo "  Port    : 3389"
+          echo "  Username: RDP"
+          echo "  Password: $RDP_PASSWORD"
+          echo "======================================"
+
+      - name: Maintain Connection
+        run: |
+          while true; do
+            echo "[$(date)] RDP Active - Address: $TAILSCALE_IP | User: RDP | Pass: $RDP_PASSWORD"
+            sleep 300
+          done
